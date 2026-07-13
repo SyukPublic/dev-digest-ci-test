@@ -35,14 +35,36 @@ else
 fi
 
 SHARED_SRC=0
+SERVER_SRC_EXTRA=()   # extra server/src files to mirror (source only) for a standalone run
 case "$PKG" in
   server)
     EXTRA_EXCLUDES=(--exclude clones --exclude dist)
     COMPANIONS=(reviewer-core)
     ;;
-  reviewer-core|mcp)
-    # Both alias `@devdigest/shared` -> ../server/src/vendor/shared (source, no install needed).
-    # Mirror just that subtree so the alias resolves when the package is the standalone primary.
+  agent-runner)
+    # Aliases BOTH @devdigest/reviewer-core (companion → own install) AND
+    # @devdigest/shared (source subtree). reviewer-core itself resolves
+    # @devdigest/shared -> ../server/src/vendor/shared, so SHARED_SRC=1 covers both.
+    EXTRA_EXCLUDES=(--exclude dist)
+    COMPANIONS=(reviewer-core)
+    SHARED_SRC=1
+    ;;
+  reviewer-core)
+    # Aliases `@devdigest/shared` -> ../server/src/vendor/shared (source, no install).
+    # PLUS its tests reach directly into server source: test/{extract-conventions,run}.test.ts
+    # import ../../server/src/adapters/mocks.js, which imports ../lib/diff-parser.js. Mirror
+    # that exact closure (2 files) so the suite is self-sufficient in ANY run order — previously
+    # it only passed if a prior `server` run had left a full server/ mirror in the same root
+    # (broke on a fresh per-worktree mirror). Both files' remaining imports are zod (reviewer-core
+    # dep) and @devdigest/shared (the SHARED_SRC alias), so no further server source is needed.
+    EXTRA_EXCLUDES=()
+    COMPANIONS=()
+    SHARED_SRC=1
+    SERVER_SRC_EXTRA=(server/src/adapters/mocks.ts server/src/lib/diff-parser.ts)
+    ;;
+  mcp)
+    # Aliases `@devdigest/shared` -> ../server/src/vendor/shared (source, no install needed).
+    # Mirror just that subtree so the alias resolves when mcp is the standalone primary.
     EXTRA_EXCLUDES=()
     COMPANIONS=()
     SHARED_SRC=1
@@ -54,7 +76,7 @@ case "$PKG" in
 esac
 
 SRC="$ROOT/$PKG"
-MIRROR_ROOT="${DEVDIGEST_MIRROR:-$HOME/.devdigest-test-mirror}"
+MIRROR_ROOT="${DEVDIGEST_MIRROR:-$HOME/.devdigest-test-mirror-$(basename "$ROOT")}"
 DST="$MIRROR_ROOT/$PKG"
 
 [ -d "$SRC" ] || { echo "package dir not found: $SRC" >&2; exit 2; }
@@ -89,6 +111,15 @@ if [ "$SHARED_SRC" = "1" ]; then
   mkdir -p "$MIRROR_ROOT/server/src/vendor"
   rsync -a --delete "$ROOT/server/src/vendor/shared/" "$MIRROR_ROOT/server/src/vendor/shared/"
 fi
+
+# Extra individual server/src source files a package's tests import directly (source only, no
+# install). Placed at the same relative path so intra-server relative imports resolve.
+for rel in ${SERVER_SRC_EXTRA[@]+"${SERVER_SRC_EXTRA[@]}"}; do
+  [ -f "$ROOT/$rel" ] || { echo "SERVER_SRC_EXTRA source missing: $ROOT/$rel" >&2; exit 2; }
+  echo "[mirror] cp $rel -> $MIRROR_ROOT/$rel (server source file)"
+  mkdir -p "$MIRROR_ROOT/$(dirname "$rel")"
+  rsync -a "$ROOT/$rel" "$MIRROR_ROOT/$rel"
+done
 
 cd "$DST"
 

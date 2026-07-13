@@ -41,3 +41,10 @@
   `server-integration`, `reviewer-core`). Adding/bumping a dependency must update BOTH
   (`pnpm install --lockfile-only` + `npm install --package-lock-only`) or every `npm ci` job fails
   with "lock file out of sync"; `package.json`, `package-lock.json`, `pnpm-lock.yaml`.
+- [2026-07-13] reviewer-core's mirror suite reaches into SERVER source — `test/extract-conventions.test.ts`
+  & `test/run.test.ts` import `../../server/src/adapters/mocks.js` → `../lib/diff-parser.js` (a layering
+  smell: a pure inner package's tests depending on outer-package source). So `test-mirror.sh` must mirror
+  that exact closure source-only (`SERVER_SRC_EXTRA` = `mocks.ts` + `diff-parser.ts`; remaining imports
+  `zod`/`@devdigest/shared` resolve already); without it a FRESH per-worktree mirror fails "Failed to load
+  url …/adapters/mocks.js" — it only ever passed via a leftover full `server/` in the shared mirror root
+  from a prior `server` run; `scripts/test-mirror.sh` (SERVER_SRC_EXTRA, reviewer-core case).
