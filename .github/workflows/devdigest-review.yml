@@ -1,0 +1,44 @@
+name: DevDigest Review
+
+# Trigger on pull_request only (never the privileged target-event variant): fork
+# PRs run WITHOUT repository secrets, so the review simply no-ops on forks instead
+# of exposing OPENROUTER_API_KEY to untrusted code.
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+
+# Least privilege: read the code, write the review. Nothing else.
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  devdigest-review:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Run DevDigest review
+        run: node .devdigest/runner/index.js
+        env:
+          # Secret is referenced, NEVER inlined. Absent on fork PRs by design.
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          DEVDIGEST_POST_AS: github_review
+      - name: Upload DevDigest result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: devdigest-result
+          path: devdigest-result.json
+          if-no-files-found: ignore
