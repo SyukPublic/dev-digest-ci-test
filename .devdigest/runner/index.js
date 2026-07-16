@@ -20691,6 +20691,10 @@ const HookScanResult = objectType({
  * table is intentionally left empty — CI runs are read from `agent_runs`.
  */
 const CiRunSummary = RunSummary.extend({
+    /** SUGGESTION-severity finding count (CI-only), enabling the 3-way severity
+     *  badge split on the CI Runs page. CRITICAL = `blockers`, WARNING =
+     *  `findings_count − blockers − suggestions`. Null for legacy CI rows. */
+    suggestions: numberType().int().nullable(),
     /** 'ci' for these rows; kept on the DTO so a mixed list stays self-describing. */
     source: stringType().nullable(),
     /** "owner/name" of the repo the CI review ran in. */
@@ -20712,6 +20716,36 @@ const CiRunSummary = RunSummary.extend({
  */
 const CiExportRequest = CiExportInput.extend({
     files: CiFile.array().nullish(),
+});
+
+;// CONCATENATED MODULE: ../server/src/vendor/shared/contracts/ci-uninstall.ts
+
+/**
+ * Multi-agent CI — uninstall ("Remove from CI") response contract.
+ *
+ * EXTENDS the barrel with a NEW file (never edits an existing one). Returned by
+ * `DELETE /agents/:id/ci-installations/:installationId`: it confirms the studio
+ * row deletion AND the branch-cleanup outcome so the client can surface a clear
+ * result without a second round-trip. Shape is fixed by the spec (SPEC-2026-07-16
+ * "Uninstall result"); the `CiInstallation` DTO stays frozen — `manifest_slug`
+ * remains an internal repository column, never exposed here.
+ */
+const CiUninstallResult = objectType({
+    /** The `ci_installations` row was deleted (AC-70). */
+    removed: booleanType(),
+    /** "owner/name" of the repo the agent was removed from. */
+    repo: stringType(),
+    /** The agent whose installation was removed. */
+    agent_id: stringType(),
+    /**
+     * The `devdigest/ci` branch was updated with a commit deleting that agent's
+     * manifest/skills (and, when last, the workflow/runner) — AC-71/AC-72.
+     */
+    branch_updated: booleanType(),
+    /** The reused export PR's URL, if one is open on `devdigest/ci` (else null). */
+    pr_url: stringType().nullable(),
+    /** This was the LAST installed agent on the repo → workflow/runner also removed (AC-72). */
+    last_agent_removed: booleanType(),
 });
 
 ;// CONCATENATED MODULE: ../server/src/vendor/shared/contracts/eval-suite.ts
@@ -21799,6 +21833,7 @@ const ModelInfo = objectType({
  * Feature agents (A1–A6) and F2 import everything from here. The barrel is
  * stable — feature agents EXTEND with new files, they do not edit existing ones.
  */
+
 
 
 
@@ -36125,8 +36160,14 @@ class RunnerError extends Error {
 
 
 
-/** Find the single agent manifest file under `<devdigestDir>/agents/`. */
-function findManifestPath(devdigestDir, deps = {}) {
+/**
+ * Find ALL agent manifest files under `<devdigestDir>/agents/` (multi-agent CI,
+ * AC-59). The single-manifest hard-fail is intentionally LIFTED: a repo with N
+ * installed agents carries N manifests on the shared branch, and the runner runs
+ * every one. Returns the paths sorted for a deterministic per-agent run order.
+ * An empty/absent directory is still a clear `RunnerError` (nothing to review).
+ */
+function findManifestPaths(devdigestDir, deps = {}) {
     const readDir = deps.readDir ?? external_node_fs_namespaceObject.readdirSync;
     const agentsDir = external_node_path_default().join(devdigestDir, 'agents');
     let entries;
@@ -36136,14 +36177,21 @@ function findManifestPath(devdigestDir, deps = {}) {
     catch (err) {
         throw new RunnerError(`Agent manifest directory not found: ${agentsDir} (${err.message})`);
     }
-    const yamlFiles = entries.filter((f) => f.endsWith('.yaml') || f.endsWith('.yml'));
+    const yamlFiles = entries.filter((f) => f.endsWith('.yaml') || f.endsWith('.yml')).sort();
     if (yamlFiles.length === 0) {
         throw new RunnerError(`No agent manifest (*.yaml) found in ${agentsDir}`);
     }
-    if (yamlFiles.length > 1) {
-        throw new RunnerError(`Expected exactly one agent manifest in ${agentsDir}, found ${yamlFiles.length}: ${yamlFiles.join(', ')}`);
-    }
-    return external_node_path_default().join(agentsDir, yamlFiles[0]);
+    return yamlFiles.map((f) => external_node_path_default().join(agentsDir, f));
+}
+/**
+ * The manifest-file basename slug (e.g. `security-reviewer-1a2b3c4d` from
+ * `.../security-reviewer-1a2b3c4d.yaml`). This is the STABLE per-agent identity
+ * the result artifact carries (`CiResultArtifact.agent`) so ingest maps each
+ * result to its own installation by the stored `manifest_slug` (AC-64). It is the
+ * only stable identity the runner can emit without unfreezing `AgentManifest`.
+ */
+function manifestSlugFromPath(manifestPath) {
+    return external_node_path_default().basename(manifestPath).replace(/\.ya?ml$/i, '');
 }
 /** Read, parse, and Zod-validate the manifest at `manifestPath` (AC-20). */
 function loadAgentManifest(manifestPath, deps = {}) {
@@ -36170,11 +36218,6 @@ function loadAgentManifest(manifestPath, deps = {}) {
         throw new RunnerError(`Agent manifest at ${manifestPath} failed validation: ${issues}`);
     }
     return result.data;
-}
-/** Convenience: locate + load + validate in one call. */
-function loadManifest(devdigestDir, deps = {}) {
-    const manifestPath = findManifestPath(devdigestDir, deps);
-    return loadAgentManifest(manifestPath, deps);
 }
 
 ;// CONCATENATED MODULE: ./src/skills.ts
@@ -36512,6 +36555,83 @@ function buildResultArtifact(input) {
 
 
 
+/** Derive a per-agent result path from the base (`devdigest-result.json` → `…-<slug>.json`). */
+function resultPathFor(base, slug) {
+    return `${base.replace(/\.json$/i, '')}-${slug}.json`;
+}
+/**
+ * Review ONE agent end-to-end, isolated. Any failure — invalid manifest, missing
+ * skill file, or an LLM/model-call error inside `reviewPullRequest` — is caught
+ * here and returned as a per-agent error (exit 1) WITHOUT posting a partial state
+ * or a synthetic review, so it never stops the other agents (AC-61).
+ */
+async function reviewAgent(params) {
+    const { slug, resultPath } = params;
+    try {
+        // Load + validate this agent's manifest BEFORE it is used (AC-20), then its skills.
+        const manifest = loadAgentManifest(params.manifestPath, { readFile: params.readFile });
+        const skills = loadSkillBodies(params.devdigestDir, manifest.skills, params.readFile);
+        // Run the SAME engine the studio uses — `assemblePrompt`/`wrapUntrusted`
+        // (diff → <untrusted source="diff">, prDescription → <untrusted
+        // source="pr-description">, AC-21/AC-78) and the mandatory `groundFindings()`
+        // gate all run INSIDE `reviewPullRequest`, once per agent.
+        const start = params.now();
+        const outcome = await reviewPullRequest({
+            systemPrompt: manifest.system_prompt,
+            model: manifest.model,
+            diff: params.diff,
+            llm: params.llm,
+            strategy: manifest.strategy,
+            skills,
+            prDescription: params.ctx.body,
+            task: `Review PR #${params.ctx.prNumber}: ${params.ctx.title}`,
+        });
+        const durationMs = params.now() - start;
+        // Deterministic verdict/gate from GROUNDED findings + this agent's own
+        // `ci_fail_on` (AC-68) — never `outcome.review.verdict`.
+        const payload = toReviewPayload(outcome.review, {
+            failOn: manifest.ci_fail_on,
+            diff: params.diff,
+            title: manifest.name,
+        });
+        const blockers = countBlockers(outcome.review.findings, manifest.ci_fail_on);
+        const triggered = gateTriggered(outcome.review.findings, manifest.ci_fail_on);
+        // Build + write this agent's artifact BEFORE posting, so a GitHub-side
+        // posting failure never loses the already-computed, already-grounded result.
+        // `agent` = the STABLE manifest-file slug (AC-64), NOT `manifest.name`.
+        const artifact = buildResultArtifact({
+            findings: outcome.review.findings,
+            costUsd: outcome.costUsd,
+            durationMs,
+            agent: slug,
+            prNumber: params.ctx.prNumber,
+        });
+        params.writeFile(resultPath, `${JSON.stringify(artifact, null, 2)}\n`);
+        // Post per `post_as` (AC-24/AC-60) — each agent posts its OWN result independently.
+        if (params.postAs === 'github_review') {
+            await postGithubReview(params.ctx, params.githubToken, payload, params.fetchImpl);
+        }
+        else if (params.postAs === 'pr_comment') {
+            await postPrComment(params.ctx, params.githubToken, payload.body, params.fetchImpl);
+        }
+        return {
+            slug,
+            agentName: manifest.name,
+            exitCode: triggered ? 1 : 0,
+            artifact,
+            posted: { kind: params.postAs, payload },
+            blockers,
+            gateTriggered: triggered,
+            resultPath,
+        };
+    }
+    catch (err) {
+        // Per-agent hard-fail: non-zero contribution, nothing posted, no artifact, no
+        // synthetic review — the other agents still run (AC-61).
+        const message = err instanceof Error ? err.message : String(err);
+        return { slug, agentName: slug, exitCode: 1, artifact: null, posted: null, error: message, resultPath };
+    }
+}
 async function runCi(deps) {
     const readFile = deps.readFile ?? external_node_fs_namespaceObject.readFileSync;
     const readDir = deps.readDir ?? external_node_fs_namespaceObject.readdirSync;
@@ -36519,82 +36639,53 @@ async function runCi(deps) {
     const now = deps.now ?? Date.now;
     const fetchImpl = deps.fetchImpl ?? fetch;
     const fetchDiffImpl = deps.fetchDiff ?? fetchPrDiff;
+    // Shared setup: locate EVERY manifest, resolve the PR context, and fetch the
+    // diff ONCE (the same PR diff feeds every agent). A failure here is a whole-run
+    // failure — no agent can review, so nothing is posted and no artifact written.
+    let manifestPaths;
+    let ctx;
+    let diff;
+    let githubToken;
     try {
-        // 1. Load + validate the manifest BEFORE it is used for anything (AC-20).
-        const manifest = loadManifest(deps.devdigestDir, { readFile, readDir });
-        const skills = loadSkillBodies(deps.devdigestDir, manifest.skills, readFile);
-        // 2. Resolve CI context (PR number/title/body/repo) from env + event payload.
-        const ctx = resolvePrContext(deps.env, readFile);
-        const githubToken = deps.env.GITHUB_TOKEN;
+        manifestPaths = findManifestPaths(deps.devdigestDir, { readDir });
+        ctx = resolvePrContext(deps.env, readFile);
+        githubToken = deps.env.GITHUB_TOKEN;
         if (deps.postAs !== 'none' && !githubToken) {
             throw new RunnerError(`GITHUB_TOKEN is required to post as '${deps.postAs}'`);
         }
-        // 3. Assemble the diff from the CI context. Strip DevDigest's own exported
-        //    artifacts (`.devdigest/**`, the generated workflow) BEFORE parse: the
-        //    minified runner bundle would otherwise fail the whole review with a
-        //    GitHub 422 "diff too large", and reviewing our own config is noise.
+        // Strip DevDigest's own exported artifacts (`.devdigest/**`, the workflow)
+        // BEFORE parse — the minified runner bundle would otherwise fail the review
+        // with a GitHub 422 "diff too large", and reviewing our own config is noise.
         const rawDiff = await fetchDiffImpl(ctx, githubToken ?? '', fetchImpl);
-        const diff = parseUnifiedDiff(stripIgnoredFiles(rawDiff));
-        // 4. Run the SAME engine the studio uses. `reviewPullRequest` internally
-        //    calls `assemblePrompt`/`wrapUntrusted` (diff → `<untrusted
-        //    source="diff">`, prDescription → `<untrusted source="pr-description">`,
-        //    AC-21) and the mandatory `groundFindings()` gate (AC-22: an all-dropped
-        //    result is a valid zero-finding review, not an error — it flows through
-        //    normally below).
-        const start = now();
-        const outcome = await reviewPullRequest({
-            systemPrompt: manifest.system_prompt,
-            model: manifest.model,
-            diff,
-            llm: deps.llm,
-            strategy: manifest.strategy,
-            skills,
-            prDescription: ctx.body,
-            task: `Review PR #${ctx.prNumber}: ${ctx.title}`,
-        });
-        const durationMs = now() - start;
-        // 5. Deterministic verdict/gate from GROUNDED findings + `ci_fail_on`
-        //    (AC-23) — never `outcome.review.verdict`.
-        const payload = toReviewPayload(outcome.review, {
-            failOn: manifest.ci_fail_on,
-            diff,
-            title: manifest.name,
-        });
-        const blockers = countBlockers(outcome.review.findings, manifest.ci_fail_on);
-        const triggered = gateTriggered(outcome.review.findings, manifest.ci_fail_on);
-        // 6. Build + write the artifact before posting, so a GitHub-side posting
-        //    failure never loses the already-computed, already-grounded result.
-        const artifact = buildResultArtifact({
-            findings: outcome.review.findings,
-            costUsd: outcome.costUsd,
-            durationMs,
-            agent: manifest.name,
-            prNumber: ctx.prNumber,
-        });
-        writeFile(deps.resultPath, `${JSON.stringify(artifact, null, 2)}\n`);
-        // 7. Post per `post_as` (AC-24).
-        if (deps.postAs === 'github_review') {
-            await postGithubReview(ctx, githubToken, payload, fetchImpl);
-        }
-        else if (deps.postAs === 'pr_comment') {
-            await postPrComment(ctx, githubToken, payload.body, fetchImpl);
-        }
-        // 'none' → post nothing (exit-code only).
-        // 8. Exit non-zero IFF the gate triggered REQUEST_CHANGES (AC-25).
-        return {
-            exitCode: triggered ? 1 : 0,
-            artifact,
-            posted: { kind: deps.postAs, payload },
-            blockers,
-            gateTriggered: triggered,
-        };
+        diff = parseUnifiedDiff(stripIgnoredFiles(rawDiff));
     }
     catch (err) {
-        // Hard-fail (Q5): non-zero exit, nothing posted, no artifact, no synthetic
-        // review skeleton — regardless of which stage above threw.
         const message = err instanceof Error ? err.message : String(err);
-        return { exitCode: 1, artifact: null, posted: null, error: message };
+        return { exitCode: 1, agents: [], error: message };
     }
+    // Per-agent loop — each isolated so a trip/hard-fail never stops the others.
+    const agents = [];
+    for (const manifestPath of manifestPaths) {
+        const slug = manifestSlugFromPath(manifestPath);
+        agents.push(await reviewAgent({
+            manifestPath,
+            slug,
+            devdigestDir: deps.devdigestDir,
+            ctx,
+            diff,
+            llm: deps.llm,
+            postAs: deps.postAs,
+            githubToken,
+            resultPath: resultPathFor(deps.resultPath, slug),
+            fetchImpl,
+            readFile,
+            writeFile,
+            now,
+        }));
+    }
+    // Aggregate exit computed AFTER all agents ran (AC-61/AC-69).
+    const exitCode = agents.some((a) => a.exitCode !== 0) ? 1 : 0;
+    return { exitCode, agents };
 }
 
 ;// CONCATENATED MODULE: ./src/index.ts
@@ -36645,12 +36736,19 @@ async function main(env = process.env) {
         readDir: external_node_fs_namespaceObject.readdirSync,
         writeFile: external_node_fs_namespaceObject.writeFileSync,
     });
-    if (result.artifact === null) {
+    // Whole-run failure (no manifests / diff-fetch failed) before any agent ran.
+    if (result.error) {
         console.error(`[agent-runner] FAILED: ${result.error}`);
     }
-    else {
-        console.log(`[agent-runner] findings=${result.artifact.findings_count} blockers=${result.blockers} ` +
-            `gateTriggered=${result.gateTriggered} posted=${result.posted.kind}`);
+    // One line per agent — a hard-failed agent logs its error, a reviewed agent its counts.
+    for (const a of result.agents) {
+        if (a.artifact === null) {
+            console.error(`[agent-runner] agent=${a.slug} FAILED: ${a.error}`);
+        }
+        else {
+            console.log(`[agent-runner] agent=${a.slug} findings=${a.artifact.findings_count} ` +
+                `blockers=${a.blockers} gateTriggered=${a.gateTriggered} posted=${a.posted?.kind}`);
+        }
     }
     return result.exitCode;
 }
